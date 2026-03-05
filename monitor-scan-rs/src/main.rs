@@ -654,7 +654,11 @@ fn main() {
 
     let channel = if cli.channel == 0 {
         eprintln!("[monitor-scan] Auto-detecting best channel (max 30s)...");
-        auto_detect(&cli.interface, &state)
+        let ch = auto_detect(&cli.interface, &state);
+        if !is_interrupted() {
+            if let Err(e) = state.set_channel(ch) { eprintln!("Error: {}", e); state.restore(); std::process::exit(1); }
+        }
+        ch
     } else {
         if let Err(e) = state.set_channel(cli.channel) { eprintln!("Error: {}", e); state.restore(); std::process::exit(1); }
         cli.channel
