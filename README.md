@@ -20,6 +20,10 @@ Forked from [0xKoda/WireMCP](https://github.com/0xKoda/WireMCP) and rewritten wi
 | **`analyze_pcap`** | Analyze existing PCAP files. Modes: `basic` or `full` | Rust |
 | **`extract_credentials`** | Extract credentials from PCAP (HTTP Basic, FTP, Telnet, Kerberos hashes) | tshark |
 | **`analyze_ddos`** | DDoS attack detection and analysis (25+ attack patterns, live or PCAP) | Rust |
+| **`create_baseline`** | Profile normal network behavior (IPs, ports, protocols, DNS, traffic rates) | Rust |
+| **`detect_anomalies`** | Compare live traffic against baseline to detect deviations | Rust |
+| **`analyze_streams`** | Deep TCP/UDP stream reassembly with payload threat detection | Rust |
+| **`source_engine_monitor`** | Source Engine game server DDoS detection (Garry's Mod, CS, TF2) | Rust |
 | **`monitor_scan`** | WiFi monitor mode scan with HTML report (clients, vendors, WiFi standards, signal) | Rust |
 
 ### Native Rust Parsing (basic mode)
@@ -88,6 +92,59 @@ The `analyze_ddos` tool detects 25+ attack patterns from live traffic or PCAP fi
 - Port scan / Scattershot detection
 - Traffic timeline with per-second packet and bandwidth visualization
 
+### Baseline Profiling & Anomaly Detection (create_baseline / detect_anomalies)
+
+Profile your network's normal behavior, then detect deviations in real-time:
+
+- **Baseline mode:** Captures traffic and builds a JSON profile of known IPs, ports, protocols, DNS domains, and traffic rates
+- **Anomaly mode:** Loads a baseline and compares live traffic, alerting on:
+  - New IPs or ports not seen in the baseline
+  - New protocols or DNS domains
+  - Bandwidth spikes (>2x baseline)
+  - Connection rate spikes
+
+### Deep Stream Analysis (analyze_streams)
+
+TCP/UDP payload reassembly with threat detection:
+
+- **TCP stream reassembly** by 5-tuple (32KB cap per direction)
+- **Shannon entropy** detection for encrypted/exfiltration data on non-encrypted channels
+- **Protocol mismatch** detection (e.g., non-TLS on port 443)
+- **Pattern matching:** shell commands, reverse shells, base64 blobs, ELF/PE binaries
+- **C2 beacon detection** via periodic interval analysis (low jitter = bot)
+- **DNS tunneling** (long subdomains + high entropy)
+- **DGA detection** (consonant ratio + entropy for algorithmically generated domains)
+
+### Source Engine Game Server Monitor (source_engine_monitor)
+
+Monitor Garry's Mod / CS:GO / TF2 servers for DDoS and abuse:
+
+- **A2S protocol parsing** (INFO, PLAYER, RULES queries + challenge-response)
+- **Query flood detection** with severity levels (MEDIUM/HIGH/CRITICAL)
+- **Amplification ratio analysis** (Source Engine responses are ~200x larger than queries)
+- **Query-only bot/scanner** identification (no game data, only queries)
+- **High packet-rate client** detection
+- **Periodic bot detection** (regular interval patterns)
+- **Distributed attack detection** (many sources, coordinated queries)
+- Per-client and per-second timeline breakdown
+
+### Firewall Hardening (scripts/firewall.sh)
+
+iptables management script with safety features:
+
+- SSH rate limiting (5 new connections/min/IP)
+- LLMNR and DNS blocking (anti-amplification)
+- ICMP rate limiting
+- LOG + DROP default policy
+- **5-minute auto-revert** if not confirmed (prevents lockout)
+
+```bash
+sudo bash scripts/firewall.sh apply    # Apply rules (auto-reverts in 5 min)
+sudo bash scripts/firewall.sh confirm  # Make permanent
+sudo bash scripts/firewall.sh revert   # Rollback
+sudo bash scripts/firewall.sh status   # Show current rules
+```
+
 ### WiFi Monitor Mode (monitor-scan-rs)
 
 The `monitor-scan-rs` binary handles 802.11 monitor mode:
@@ -105,7 +162,7 @@ The `monitor-scan-rs` binary handles 802.11 monitor mode:
 
 ### Prerequisites
 
-- Linux (tested on Fedora)
+- Linux (tested on Fedora, Debian)
 - [Wireshark](https://www.wireshark.org/download.html) (`tshark` in PATH — only needed for `full` mode and `extract_credentials`)
 - Node.js (v16+)
 - Rust toolchain (`cargo`)
@@ -181,6 +238,17 @@ node monitor-scan.js --interface wlo1 --channel 0 --duration 30 --output report.
 # DDoS analysis (live or PCAP)
 ./capture-rs/target/release/capture-packets --mode ddos --interface eth0 --duration 60
 ./capture-rs/target/release/capture-packets --mode ddos --file attack.pcap
+
+# Baseline profiling & anomaly detection
+BASELINE_OUTPUT=baseline.json ./capture-rs/target/release/capture-packets --mode baseline --interface eth0 --duration 60
+BASELINE_FILE=baseline.json ./capture-rs/target/release/capture-packets --mode anomaly --interface eth0 --duration 30
+
+# Deep stream analysis
+./capture-rs/target/release/capture-packets --mode streams --interface eth0 --duration 15
+./capture-rs/target/release/capture-packets --mode streams --file capture.pcap
+
+# Source Engine game server monitoring
+SOURCE_PORT=27015 ./capture-rs/target/release/capture-packets --mode source-engine --interface eth0 --duration 120
 ```
 
 ## Performance
@@ -195,12 +263,18 @@ node monitor-scan.js --interface wlo1 --channel 0 --duration 30 --output report.
 
 ```
 WireMCP-rs/
-  index.js              # MCP server (9 tools, prompts)
+  index.js              # MCP server (13 tools, prompts)
   monitor-scan.js       # Standalone monitor mode CLI
-  capture-rs/           # Rust: packet capture + parsing + DDoS detection
-    src/main.rs         #   Modes: basic, full, stats, conversations, ddos
+  capture-rs/           # Rust: packet capture + parsing + analysis
+    src/main.rs         #   Modes: basic, full, stats, conversations, ddos,
+    src/capture.rs      #          baseline, anomaly, streams, source-engine
+    src/baseline.rs     #   Baseline profiling & anomaly detection
+    src/streams.rs      #   TCP/UDP stream reassembly & threat detection
+    src/sourceengine.rs #   Source Engine protocol DDoS detection
   monitor-scan-rs/      # Rust: WiFi monitor mode scanner
     src/main.rs         #   802.11 parsing, HTML report generation
+  scripts/
+    firewall.sh         # iptables management with auto-revert safety
 ```
 
 ## License
