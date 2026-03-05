@@ -884,6 +884,258 @@ fn run_conversations(cli: &Cli) {
     print_table("UDP", &udp_convs);
 }
 
+// --- DDoS analysis mode ---
+fn run_ddos(cli: &Cli) {
+    use std::collections::HashMap;
+
+    struct SrcStats {
+        pkts: u64,
+        bytes: u64,
+        syn_count: u64,
+        ack_count: u64,
+        udp_count: u64,
+        icmp_count: u64,
+        dst_ports: HashMap<u16, u64>,
+        first_seen: f64,
+        last_seen: f64,
+    }
+
+    impl SrcStats {
+        fn new(t: f64) -> Self {
+            Self { pkts: 0, bytes: 0, syn_count: 0, ack_count: 0, udp_count: 0, icmp_count: 0,
+                   dst_ports: HashMap::new(), first_seen: t, last_seen: t }
+        }
+    }
+
+    // Per-destination tracking for amplification detection
+    struct AmpStats { requests: u64, req_bytes: u64, responses: u64, resp_bytes: u64 }
+
+    let mut sources: HashMap<String, SrcStats> = HashMap::new();
+    let mut dst_stats: HashMap<String, u64> = HashMap::new();
+    let mut dns_amp: HashMap<String, AmpStats> = HashMap::new();
+    let mut ntp_amp: HashMap<String, AmpStats> = HashMap::new();
+    let mut ssdp_amp: HashMap<String, AmpStats> = HashMap::new();
+
+    // Time buckets (1s intervals)
+    let mut time_buckets: HashMap<u64, (u64, u64)> = HashMap::new(); // second -> (pkts, bytes)
+    let mut total_pkts = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_syn = 0u64;
+    let mut total_synack = 0u64;
+    let mut total_rst = 0u64;
+    let mut frag_count = 0u64;
+
+    capture_basic(cli, |data, time| {
+        total_pkts += 1;
+        total_bytes += data.len() as u64;
+
+        let bucket = time as u64;
+        let e = time_buckets.entry(bucket).or_default();
+        e.0 += 1;
+        e.1 += data.len() as u64;
+
+        if data.len() < 14 { return; }
+        let ethertype = u16be(data, 12);
+        let mut payload = &data[14..];
+        let ethertype = if ethertype == 0x8100 && payload.len() >= 4 {
+            let et = u16be(payload, 2); payload = &payload[4..]; et
+        } else { ethertype };
+
+        let (src_ip, dst_ip, proto, ip_payload) = match ethertype {
+            0x0800 if payload.len() >= 20 => {
+                let ihl = (payload[0] & 0x0F) as usize * 4;
+                let flags = u16be(payload, 6);
+                let mf = (flags & 0x2000) != 0;
+                let frag_off = flags & 0x1FFF;
+                if mf || frag_off > 0 { frag_count += 1; }
+                (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]), payload[9], &payload[ihl.min(payload.len())..])
+            }
+            0x86DD if payload.len() >= 40 => {
+                (ip6_fmt(&payload[8..24]), ip6_fmt(&payload[24..40]), payload[6], &payload[40..])
+            }
+            _ => return,
+        };
+
+        let pkt_len = data.len() as u64;
+        *dst_stats.entry(dst_ip.clone()).or_default() += 1;
+
+        let s = sources.entry(src_ip.clone()).or_insert_with(|| SrcStats::new(time));
+        s.pkts += 1;
+        s.bytes += pkt_len;
+        s.last_seen = time;
+
+        match proto {
+            6 if ip_payload.len() >= 14 => { // TCP
+                let dp = u16be(ip_payload, 2);
+                let flags = ip_payload[13];
+                let is_syn = (flags & 0x02) != 0;
+                let is_ack = (flags & 0x10) != 0;
+                let is_rst = (flags & 0x04) != 0;
+
+                if is_syn && !is_ack { s.syn_count += 1; total_syn += 1; }
+                if is_syn && is_ack { total_synack += 1; }
+                if is_rst { total_rst += 1; }
+                if is_ack { s.ack_count += 1; }
+                *s.dst_ports.entry(dp).or_default() += 1;
+            }
+            17 if ip_payload.len() >= 8 => { // UDP
+                let sp = u16be(ip_payload, 0);
+                let dp = u16be(ip_payload, 2);
+                s.udp_count += 1;
+                *s.dst_ports.entry(dp).or_default() += 1;
+
+                // Amplification detection
+                if sp == 53 || dp == 53 {
+                    let e = dns_amp.entry(dst_ip.clone()).or_insert_with(|| AmpStats { requests: 0, req_bytes: 0, responses: 0, resp_bytes: 0 });
+                    if sp == 53 { e.responses += 1; e.resp_bytes += pkt_len; }
+                    else { e.requests += 1; e.req_bytes += pkt_len; }
+                }
+                if sp == 123 || dp == 123 {
+                    let e = ntp_amp.entry(dst_ip.clone()).or_insert_with(|| AmpStats { requests: 0, req_bytes: 0, responses: 0, resp_bytes: 0 });
+                    if sp == 123 { e.responses += 1; e.resp_bytes += pkt_len; }
+                    else { e.requests += 1; e.req_bytes += pkt_len; }
+                }
+                if sp == 1900 || dp == 1900 {
+                    let e = ssdp_amp.entry(dst_ip.clone()).or_insert_with(|| AmpStats { requests: 0, req_bytes: 0, responses: 0, resp_bytes: 0 });
+                    if sp == 1900 { e.responses += 1; e.resp_bytes += pkt_len; }
+                    else { e.requests += 1; e.req_bytes += pkt_len; }
+                }
+            }
+            1 | 58 => { // ICMP / ICMPv6
+                s.icmp_count += 1;
+            }
+            _ => {}
+        }
+    });
+
+    // --- Analysis & Output ---
+    let duration = if let Some(max_t) = time_buckets.keys().max() { *max_t as f64 + 1.0 } else { 1.0 };
+    let pps = total_pkts as f64 / duration;
+    let bps = total_bytes as f64 * 8.0 / duration;
+
+    println!("=== DDoS Analysis Report ===\n");
+
+    // Overview
+    println!("[Overview]");
+    println!("  Duration:       {:.1}s", duration);
+    println!("  Total packets:  {} ({:.0} pkt/s)", total_pkts, pps);
+    println!("  Total bytes:    {} ({:.1} Mbit/s)", total_bytes, bps / 1_000_000.0);
+    println!("  Unique sources: {}", sources.len());
+    println!("  Fragmented:     {}", frag_count);
+    println!();
+
+    // TCP flags analysis
+    println!("[TCP Flags]");
+    println!("  SYN:     {} ({:.1}%)", total_syn, if total_pkts > 0 { total_syn as f64 / total_pkts as f64 * 100.0 } else { 0.0 });
+    println!("  SYN+ACK: {}", total_synack);
+    println!("  RST:     {}", total_rst);
+    let syn_ratio = if total_synack > 0 { total_syn as f64 / total_synack as f64 } else if total_syn > 0 { f64::INFINITY } else { 0.0 };
+    if syn_ratio > 3.0 && total_syn > 100 {
+        println!("  >> SYN FLOOD DETECTED: SYN/SYN+ACK ratio = {:.1} (expected ~1.0)", syn_ratio);
+    } else if syn_ratio > 3.0 && total_syn > 10 {
+        println!("  >> SYN flood suspected: SYN/SYN+ACK ratio = {:.1}", syn_ratio);
+    }
+    println!();
+
+    // Traffic timeline
+    println!("[Traffic Timeline (pkt/s | Kbit/s)]");
+    let mut buckets: Vec<_> = time_buckets.iter().collect();
+    buckets.sort_by_key(|(&k, _)| k);
+    let max_pps = buckets.iter().map(|(_, (p, _))| *p).max().unwrap_or(1);
+    for (sec, (pkts, bytes)) in &buckets {
+        let bar_len = (*pkts as f64 / max_pps as f64 * 40.0) as usize;
+        let bar: String = "#".repeat(bar_len);
+        println!("  {:>4}s: {:>6} pkt/s  {:>8} Kb/s  {}", sec, pkts, bytes * 8 / 1000, bar);
+    }
+    let peak_pps = buckets.iter().map(|(_, (p, _))| *p).max().unwrap_or(0);
+    let peak_bps = buckets.iter().map(|(_, (_, b))| *b * 8).max().unwrap_or(0);
+    println!("  Peak: {} pkt/s, {:.1} Mbit/s", peak_pps, peak_bps as f64 / 1_000_000.0);
+    println!();
+
+    // Top source IPs by packets
+    println!("[Top 15 Source IPs by packets]");
+    let mut src_sorted: Vec<_> = sources.iter().collect();
+    src_sorted.sort_by(|a, b| b.1.pkts.cmp(&a.1.pkts));
+    println!("  {:<40} {:>8} {:>10} {:>6} {:>6} {:>6} {:>8}", "IP", "Packets", "Bytes", "SYN", "UDP", "ICMP", "Ports");
+    for (ip, s) in src_sorted.iter().take(15) {
+        let dur = s.last_seen - s.first_seen;
+        let port_count = s.dst_ports.len();
+        let rate = if dur > 0.0 { format!("({:.0}/s)", s.pkts as f64 / dur) } else { String::new() };
+        println!("  {:<40} {:>8} {:>10} {:>6} {:>6} {:>6} {:>5} dst {}", ip, s.pkts, s.bytes, s.syn_count, s.udp_count, s.icmp_count, port_count, rate);
+    }
+    println!();
+
+    // Top destination IPs (targets)
+    println!("[Top 10 Destination IPs (targets)]");
+    let mut dst_sorted: Vec<_> = dst_stats.iter().collect();
+    dst_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    for (ip, pkts) in dst_sorted.iter().take(10) {
+        println!("  {:<40} {:>8} packets", ip, pkts);
+    }
+    println!();
+
+    // Port scan detection (many dst ports from one source)
+    let scanners: Vec<_> = sources.iter().filter(|(_, s)| s.dst_ports.len() > 20 && s.pkts > 50).collect();
+    if !scanners.is_empty() {
+        println!("[Port Scan Detection]");
+        for (ip, s) in &scanners {
+            println!("  >> {} hit {} different ports ({} packets)", ip, s.dst_ports.len(), s.pkts);
+        }
+        println!();
+    }
+
+    // Amplification detection
+    let print_amp = |name: &str, amp: &HashMap<String, AmpStats>| {
+        let suspicious: Vec<_> = amp.iter().filter(|(_, a)| a.resp_bytes > a.req_bytes * 5 && a.responses > 10).collect();
+        if suspicious.is_empty() { return; }
+        println!("[{} Amplification Detected]", name);
+        for (ip, a) in &suspicious {
+            let ratio = if a.req_bytes > 0 { a.resp_bytes as f64 / a.req_bytes as f64 } else { f64::INFINITY };
+            println!("  >> {} — {} requests ({} B) -> {} responses ({} B) — amplification: {:.1}x",
+                ip, a.requests, a.req_bytes, a.responses, a.resp_bytes, ratio);
+        }
+        println!();
+    };
+    print_amp("DNS", &dns_amp);
+    print_amp("NTP", &ntp_amp);
+    print_amp("SSDP", &ssdp_amp);
+
+    // Flood detection summary
+    println!("[Flood Detection Summary]");
+    let mut alerts = Vec::new();
+
+    if syn_ratio > 3.0 && total_syn > 100 {
+        alerts.push(format!("SYN Flood: {} SYN packets, ratio SYN/SYN+ACK = {:.1}", total_syn, syn_ratio));
+    }
+
+    let udp_total: u64 = sources.values().map(|s| s.udp_count).sum();
+    if udp_total as f64 / total_pkts.max(1) as f64 > 0.8 && pps > 100.0 {
+        alerts.push(format!("UDP Flood: {:.0}% of traffic is UDP ({:.0} pkt/s)", udp_total as f64 / total_pkts as f64 * 100.0, pps));
+    }
+
+    let icmp_total: u64 = sources.values().map(|s| s.icmp_count).sum();
+    if icmp_total as f64 / total_pkts.max(1) as f64 > 0.5 && pps > 50.0 {
+        alerts.push(format!("ICMP Flood: {:.0}% of traffic is ICMP ({} packets)", icmp_total as f64 / total_pkts as f64 * 100.0, icmp_total));
+    }
+
+    if frag_count as f64 / total_pkts.max(1) as f64 > 0.3 && frag_count > 50 {
+        alerts.push(format!("Fragmentation attack: {} fragmented packets ({:.0}%)", frag_count, frag_count as f64 / total_pkts as f64 * 100.0));
+    }
+
+    // Many sources = distributed
+    if sources.len() > 50 && pps > 500.0 {
+        alerts.push(format!("Distributed attack: {} unique sources at {:.0} pkt/s", sources.len(), pps));
+    }
+
+    if alerts.is_empty() {
+        println!("  No DDoS patterns detected.");
+    } else {
+        for a in &alerts {
+            println!("  >> {}", a);
+        }
+    }
+}
+
 // --- Main ---
 fn main() {
     let cli = Cli::parse();
@@ -898,8 +1150,9 @@ fn main() {
         "full" => run_full(&cli),
         "stats" => run_stats(&cli),
         "conversations" => run_conversations(&cli),
+        "ddos" => run_ddos(&cli),
         other => {
-            eprintln!("Error: Unknown mode '{}'. Use basic, full, stats, or conversations.", other);
+            eprintln!("Error: Unknown mode '{}'. Use basic, full, stats, conversations, or ddos.", other);
             std::process::exit(1);
         }
     }

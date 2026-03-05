@@ -501,6 +501,42 @@ server.tool(
   }
 );
 
+// Tool 9: DDoS analysis (Rust backend)
+server.tool(
+  'analyze_ddos',
+  'Analyze traffic for DDoS attack patterns: SYN flood, UDP flood, ICMP flood, amplification (DNS/NTP/SSDP), port scanning, fragmentation attacks. Live capture or PCAP file.',
+  {
+    interface: z.string().optional().default('wlo1').describe('Network interface to capture from'),
+    duration: z.number().optional().default(30).describe('Capture duration in seconds (longer = better detection)'),
+    pcapPath: z.string().optional().default('').describe('Analyze a PCAP file instead of live capture'),
+  },
+  async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
+    try { await fs.access(captureBin); } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
+    try {
+      const iface = sanitizeIface(args.interface);
+      const duration = args.duration;
+      let cmd;
+      if (args.pcapPath) {
+        await fs.access(args.pcapPath);
+        cmd = `${captureBin} --mode ddos --file "${args.pcapPath}"`;
+        console.error(`[analyze_ddos] Analyzing ${args.pcapPath}`);
+      } else {
+        cmd = `${captureBin} --mode ddos --interface ${iface} --duration ${duration}`;
+        console.error(`[analyze_ddos] Live capture on ${iface} for ${duration}s`);
+      }
+      const { stdout, stderr } = await execAsync(cmd, { timeout: (duration + 60) * 1000 });
+      if (stderr) console.error(stderr);
+      return { content: [{ type: 'text', text: stdout }] };
+    } catch (error) {
+      console.error(`Error in analyze_ddos: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${error.stderr || ''}` }], isError: true };
+    }
+  }
+);
+
 // Add prompts for each tool
 server.prompt(
   'capture_packets_prompt',
@@ -670,6 +706,29 @@ server.prompt(
 3. Signal strength analysis
 4. Any interesting SSIDs being probed by devices
 5. Generate a full HTML report`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'analyze_ddos_prompt',
+  {
+    interface: z.string().optional().describe('Network interface to capture from'),
+    duration: z.number().optional().describe('Capture duration in seconds'),
+  },
+  ({ interface: iface = 'wlo1', duration = 30 }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze traffic on interface ${iface} for ${duration} seconds for DDoS attack patterns:
+1. Check for SYN flood (high SYN/SYN+ACK ratio)
+2. Check for UDP/ICMP flood (volume analysis)
+3. Detect amplification attacks (DNS/NTP/SSDP reflection)
+4. Identify top attackers and targets
+5. Check for port scanning activity
+6. Provide mitigation recommendations`
       }
     }]
   })
