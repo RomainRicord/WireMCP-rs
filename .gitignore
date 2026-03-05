@@ -46,6 +46,10 @@ dist/
 build/
 out/
 
+# Rust build artifacts
+**/target/
+
+
 # Test coverage
 coverage/
 

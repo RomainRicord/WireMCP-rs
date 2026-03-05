@@ -4,6 +4,7 @@ const { exec } = require('child_process');
 const { promisify } = require('util');
 const which = require('which');
 const fs = require('fs').promises;
+const path = require('path');
 const execAsync = promisify(exec);
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -38,210 +39,179 @@ async function findTshark() {
   }
 }
 
+// Sanitize network interface name (alphanumeric, dash, underscore, dot only)
+function sanitizeIface(name) {
+  if (!/^[a-zA-Z0-9_.\-]+$/.test(name)) {
+    throw new Error(`Invalid interface name: ${name}`);
+  }
+  return name;
+}
+
 // Initialize MCP server
 const server = new McpServer({
   name: 'wiremcp',
   version: '1.0.0',
 });
 
-// Tool 1: Capture live packet data
+// Tool 1: Capture live packet data (Rust backend)
 server.tool(
   'capture_packets',
-  'Capture live traffic and provide raw packet data as JSON for LLM analysis',
+  'Capture live traffic and provide raw packet data as JSON for LLM analysis. Uses native Rust parsing (basic) or tshark deep dissection (full).',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
+    interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
     duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    mode: z.enum(['basic', 'full']).optional().default('basic').describe('basic = fast native Rust parsing (IP, TCP, UDP, DNS, TLS SNI, HTTP, ARP, ICMP, DHCP), full = tshark deep dissection (all protocols)'),
   },
   async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
     try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
-      console.error(`Capturing packets on ${interface} for ${duration}s`);
+      await fs.access(captureBin);
+    } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
+    try {
+      const iface = sanitizeIface(args.interface);
+      const duration = args.duration;
+      const mode = args.mode;
+      console.error(`[capture_packets] ${mode} mode on ${iface} for ${duration}s`);
 
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tcp.flags -e frame.time -e http.request.method -e http.response.code`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        `${captureBin} --interface ${iface} --duration ${duration} --mode ${mode} --max-chars 720000`,
+        { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 }
       );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
-      let packets = JSON.parse(stdout);
-
-      const maxChars = 720000;
-      let jsonString = JSON.stringify(packets);
-      if (jsonString.length > maxChars) {
-        const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
-        packets = packets.slice(0, trimCount);
-        jsonString = JSON.stringify(packets);
-        console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
-      }
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
+      if (stderr) console.error(stderr);
 
       return {
         content: [{
           type: 'text',
-          text: `Captured packet data (JSON for LLM analysis):\n${jsonString}`,
+          text: `Captured packet data (${mode} mode, JSON):\n${stdout}`,
         }],
       };
     } catch (error) {
       console.error(`Error in capture_packets: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      const stderr = error.stderr || '';
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${stderr}` }], isError: true };
     }
   }
 );
 
-// Tool 2: Capture and provide summary statistics
+// Tool 2: Capture and provide summary statistics (Rust backend)
 server.tool(
   'get_summary_stats',
-  'Capture live traffic and provide protocol hierarchy statistics for LLM analysis',
+  'Capture live traffic and provide protocol hierarchy statistics for LLM analysis. Uses native Rust packet parsing.',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
+    interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
     duration: z.number().optional().default(5).describe('Capture duration in seconds'),
   },
   async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
+    try { await fs.access(captureBin); } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
     try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
-      console.error(`Capturing summary stats on ${interface} for ${duration}s`);
-
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-
+      const iface = sanitizeIface(args.interface);
+      const duration = args.duration;
+      console.error(`[get_summary_stats] Rust stats on ${iface} for ${duration}s`);
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -qz io,phs`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        `${captureBin} --interface ${iface} --duration ${duration} --mode stats`,
+        { timeout: (duration + 60) * 1000 }
       );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Protocol hierarchy statistics for LLM analysis:\n${stdout}`,
-        }],
-      };
+      if (stderr) console.error(stderr);
+      return { content: [{ type: 'text', text: `Protocol hierarchy statistics:\n${stdout}` }] };
     } catch (error) {
       console.error(`Error in get_summary_stats: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${error.stderr || ''}` }], isError: true };
     }
   }
 );
 
-// Tool 3: Capture and provide conversation stats
+// Tool 3: Capture and provide conversation stats (Rust backend)
 server.tool(
   'get_conversations',
-  'Capture live traffic and provide TCP/UDP conversation statistics for LLM analysis',
+  'Capture live traffic and provide TCP/UDP conversation statistics for LLM analysis. Uses native Rust packet parsing.',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
+    interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
     duration: z.number().optional().default(5).describe('Capture duration in seconds'),
   },
   async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
+    try { await fs.access(captureBin); } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
     try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
-      console.error(`Capturing conversations on ${interface} for ${duration}s`);
-
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-
+      const iface = sanitizeIface(args.interface);
+      const duration = args.duration;
+      console.error(`[get_conversations] Rust conversations on ${iface} for ${duration}s`);
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -qz conv,tcp`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        `${captureBin} --interface ${iface} --duration ${duration} --mode conversations`,
+        { timeout: (duration + 60) * 1000 }
       );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
-      return {
-        content: [{
-          type: 'text',
-          text: `TCP/UDP conversation statistics for LLM analysis:\n${stdout}`,
-        }],
-      };
+      if (stderr) console.error(stderr);
+      return { content: [{ type: 'text', text: `TCP/UDP conversation statistics:\n${stdout}` }] };
     } catch (error) {
       console.error(`Error in get_conversations: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${error.stderr || ''}` }], isError: true };
     }
   }
 );
 
-// Tool 4: Capture traffic and check threats against URLhaus
+// Tool 4: Capture traffic and check threats against URLhaus (Rust capture + JS URLhaus)
 server.tool(
   'check_threats',
-  'Capture live traffic and check IPs against URLhaus blacklist',
+  'Capture live traffic and check IPs against URLhaus blacklist. Uses Rust for fast capture, JS for threat lookup.',
   {
-    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
+    interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
     duration: z.number().optional().default(5).describe('Capture duration in seconds'),
   },
   async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
+    try { await fs.access(captureBin); } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
     try {
-      const tsharkPath = await findTshark();
-      const { interface, duration } = args;
-      const tempPcap = 'temp_capture.pcap';
-      console.error(`Capturing traffic on ${interface} for ${duration}s to check threats`);
+      const iface = sanitizeIface(args.interface);
+      const duration = args.duration;
+      console.error(`[check_threats] Capturing on ${iface} for ${duration}s`);
 
-      await execAsync(
-        `${tsharkPath} -i ${interface} -w ${tempPcap} -a duration:${duration}`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      const { stdout, stderr } = await execAsync(
+        `${captureBin} --interface ${iface} --duration ${duration} --mode basic --max-chars 0`,
+        { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 }
       );
+      if (stderr) console.error(stderr);
 
-      const { stdout } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -T fields -e ip.src -e ip.dst`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
-      );
-      const ips = [...new Set(stdout.split('\n').flatMap(line => line.split('\t')).filter(ip => ip && ip !== 'unknown'))];
-      console.error(`Captured ${ips.length} unique IPs: ${ips.join(', ')}`);
+      // Extract unique IPs from Rust JSON output
+      const ipRegex = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
+      const packets = JSON.parse(stdout);
+      const ips = [...new Set(packets.flatMap(p => {
+        const found = [];
+        if (p.ip_src) found.push(p.ip_src);
+        if (p.ip_dst) found.push(p.ip_dst);
+        return found;
+      }).filter(ip => ip))];
+      console.error(`Captured ${ips.length} unique IPs`);
 
-      const urlhausUrl = 'https://urlhaus.abuse.ch/downloads/text/';
-      console.error(`Fetching URLhaus blacklist from ${urlhausUrl}`);
-      let urlhausData;
+      // URLhaus check
       let urlhausThreats = [];
       try {
-        const response = await axios.get(urlhausUrl);
-        console.error(`URLhaus response status: ${response.status}, length: ${response.data.length} chars`);
-        console.error(`URLhaus raw data (first 200 chars): ${response.data.slice(0, 200)}`);
-        const ipRegex = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/;
-        urlhausData = [...new Set(response.data.split('\n')
-          .map(line => {
-            const match = line.match(ipRegex);
-            return match ? match[0] : null;
-          })
+        const response = await axios.get('https://urlhaus.abuse.ch/downloads/text/');
+        const urlhausIps = [...new Set(response.data.split('\n')
+          .map(line => { const m = line.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/); return m ? m[0] : null; })
           .filter(ip => ip))];
-        console.error(`URLhaus lookup successful: ${urlhausData.length} blacklist IPs fetched`);
-        console.error(`Sample URLhaus IPs: ${urlhausData.slice(0, 5).join(', ') || 'None'}`);
-        urlhausThreats = ips.filter(ip => urlhausData.includes(ip));
-        console.error(`Checked IPs against URLhaus: ${urlhausThreats.length} threats found - ${urlhausThreats.join(', ') || 'None'}`);
+        console.error(`URLhaus: ${urlhausIps.length} blacklist IPs`);
+        urlhausThreats = ips.filter(ip => urlhausIps.includes(ip));
       } catch (e) {
-        console.error(`Failed to fetch URLhaus data: ${e.message}`);
-        urlhausData = [];
+        console.error(`Failed to fetch URLhaus: ${e.message}`);
       }
 
-      const outputText = `Captured IPs:\n${ips.join('\n')}\n\n` +
-        `Threat check against URLhaus blacklist:\n${
-          urlhausThreats.length > 0 ? `Potential threats: ${urlhausThreats.join(', ')}` : 'No threats detected in URLhaus blacklist.'
-        }`;
-
-      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
-
       return {
-        content: [{ type: 'text', text: outputText }],
+        content: [{ type: 'text', text: `Captured IPs:\n${ips.join('\n')}\n\nThreat check against URLhaus blacklist:\n${
+          urlhausThreats.length > 0 ? `Potential threats: ${urlhausThreats.join(', ')}` : 'No threats detected in URLhaus blacklist.'
+        }` }],
       };
     } catch (error) {
       console.error(`Error in check_threats: ${error.message}`);
-      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${error.stderr || ''}` }], isError: true };
     }
   }
 );
@@ -297,62 +267,35 @@ server.tool(
   }
 );
 
-// Tool 6: Analyze an existing PCAP file for general context
+// Tool 6: Analyze an existing PCAP file (Rust backend)
 server.tool(
   'analyze_pcap',
-  'Analyze a PCAP file and provide general packet data as JSON for LLM analysis',
+  'Analyze a PCAP file and provide packet data as JSON for LLM analysis. Uses native Rust parsing (basic) or tshark deep dissection (full).',
   {
     pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    mode: z.enum(['basic', 'full']).optional().default('basic').describe('basic = fast native Rust parsing, full = tshark deep dissection'),
   },
   async (args) => {
+    const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
     try {
-      const tsharkPath = await findTshark();
-      const { pcapPath } = args;
-      console.error(`Analyzing PCAP file: ${pcapPath}`);
+      await fs.access(captureBin);
+    } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${captureBin}. Run: cd capture-rs && cargo build --release` }], isError: true };
+    }
 
-      // Check if file exists
+    try {
+      const { pcapPath, mode } = args;
+      console.error(`[analyze_pcap] ${mode} mode on ${pcapPath}`);
       await fs.access(pcapPath);
 
-      // Extract broad packet data
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${pcapPath}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e http.host -e http.request.uri -e frame.protocols`,
-        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        `${captureBin} --mode ${mode} --file "${pcapPath}" --max-chars 720000`,
+        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
       );
-      if (stderr) console.error(`tshark stderr: ${stderr}`);
-      const packets = JSON.parse(stdout);
-
-      const ips = [...new Set(packets.flatMap(p => [
-        p._source?.layers['ip.src']?.[0],
-        p._source?.layers['ip.dst']?.[0]
-      ]).filter(ip => ip))];
-      console.error(`Found ${ips.length} unique IPs: ${ips.join(', ')}`);
-
-      const urls = packets
-        .filter(p => p._source?.layers['http.host'] && p._source?.layers['http.request.uri'])
-        .map(p => `http://${p._source.layers['http.host'][0]}${p._source.layers['http.request.uri'][0]}`);
-      console.error(`Found ${urls.length} URLs: ${urls.join(', ') || 'None'}`);
-
-      const protocols = [...new Set(packets.map(p => p._source?.layers['frame.protocols']?.[0]))].filter(p => p);
-      console.error(`Found protocols: ${protocols.join(', ') || 'None'}`);
-
-      const maxChars = 720000;
-      let jsonString = JSON.stringify(packets);
-      if (jsonString.length > maxChars) {
-        const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
-        packets.splice(trimCount);
-        jsonString = JSON.stringify(packets);
-        console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
-      }
-
-      const outputText = `Analyzed PCAP: ${pcapPath}\n\n` +
-        `Unique IPs:\n${ips.join('\n')}\n\n` +
-        `URLs:\n${urls.length > 0 ? urls.join('\n') : 'None'}\n\n` +
-        `Protocols:\n${protocols.join('\n') || 'None'}\n\n` +
-        `Packet Data (JSON for LLM):\n${jsonString}`;
+      if (stderr) console.error(stderr);
 
       return {
-        content: [{ type: 'text', text: outputText }],
+        content: [{ type: 'text', text: `Analyzed PCAP (${mode} mode): ${pcapPath}\n\n${stdout}` }],
       };
     } catch (error) {
       console.error(`Error in analyze_pcap: ${error.message}`);
@@ -508,23 +451,75 @@ server.tool(
     }
   );
 
+// Tool 8: Monitor mode scan with HTML report (Rust backend)
+server.tool(
+  'monitor_scan',
+  'Switch to monitor mode, scan WiFi clients on a channel, generate an HTML report, then restore managed mode. Uses native Rust binary for fast 802.11 parsing.',
+  {
+    interface: z.string().optional().default('wlo1').describe('WiFi interface to use'),
+    channel: z.number().optional().default(0).describe('WiFi channel to monitor (0 = auto-detect best channel)'),
+    duration: z.number().optional().default(30).describe('Capture duration in seconds'),
+    outputPath: z.string().optional().default('').describe('Output HTML file path (default: ./rapport_monitor.html)'),
+  },
+  async (args) => {
+    const iface = sanitizeIface(args.interface);
+    const duration = args.duration;
+    const outputFile = args.outputPath || path.join(process.cwd(), 'rapport_monitor.html');
+    const binPath = path.join(__dirname, 'monitor-scan-rs', 'target', 'release', 'monitor-scan');
+
+    try {
+      // Check binary exists
+      await fs.access(binPath);
+    } catch {
+      return { content: [{ type: 'text', text: `Error: Rust binary not found at ${binPath}. Run: cd monitor-scan-rs && cargo build --release` }], isError: true };
+    }
+
+    try {
+      console.error(`[monitor_scan] Running Rust scanner: ${iface} ch${args.channel} ${duration}s`);
+      const { stdout, stderr } = await execAsync(
+        `${binPath} --interface ${iface} --channel ${args.channel} --duration ${duration} --output "${outputFile}"`,
+        { timeout: (duration + 120) * 1000 }
+      );
+
+      // Parse summary from stderr
+      const lines = stderr.split('\n').filter(l => l.trim());
+      const doneLine = lines.find(l => l.includes('Done!')) || '';
+      const summary = doneLine
+        ? `Monitor scan complete (Rust):\n${doneLine.replace('[monitor-scan] ', '')}\n- Report saved to: ${outputFile}`
+        : `Monitor scan complete. Report saved to: ${outputFile}`;
+
+      console.error(stderr);
+      return { content: [{ type: 'text', text: summary }] };
+
+    } catch (error) {
+      console.error(`Error in monitor_scan: ${error.message}`);
+      // stderr often contains useful info even on failure
+      const stderr = error.stderr || '';
+      console.error(stderr);
+      return { content: [{ type: 'text', text: `Error: ${error.message}\n${stderr}` }], isError: true };
+    }
+  }
+);
+
 // Add prompts for each tool
 server.prompt(
   'capture_packets_prompt',
   {
     interface: z.string().optional().describe('Network interface to capture from'),
     duration: z.number().optional().describe('Duration in seconds to capture'),
+    mode: z.string().optional().describe('basic (fast Rust) or full (tshark deep)'),
   },
-  ({ interface = 'en0', duration = 5 }) => ({
+  ({ interface: iface = 'wlo1', duration = 5, mode = 'basic' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze the network traffic on interface ${interface} for ${duration} seconds and provide insights about:
+        text: `Please analyze the network traffic on interface ${iface} for ${duration} seconds (mode: ${mode}) and provide insights about:
 1. The types of traffic observed
 2. Any notable patterns or anomalies
 3. Key IP addresses and ports involved
-4. Potential security concerns`
+4. DNS queries and TLS connections (SNI)
+5. Potential security concerns`
       }
     }]
   })
@@ -617,18 +612,21 @@ server.prompt(
   'analyze_pcap_prompt',
   {
     pcapPath: z.string().describe('Path to the PCAP file'),
+    mode: z.string().optional().describe('basic (fast Rust) or full (tshark deep)'),
   },
-  ({ pcapPath }) => ({
+  ({ pcapPath, mode = 'basic' }) => ({
     messages: [{
       role: 'user',
       content: {
         type: 'text',
-        text: `Please analyze the PCAP file at ${pcapPath} and provide insights about:
+        text: `Please analyze the PCAP file at ${pcapPath} (mode: ${mode}) and provide insights about:
 1. Overall traffic patterns
 2. Unique IPs and their interactions
-3. Protocols and services used
-4. Notable events or anomalies
-5. Potential security concerns`
+3. DNS queries and resolved domains
+4. TLS connections and SNI hostnames
+5. Protocols and services used
+6. Notable events or anomalies
+7. Potential security concerns`
       }
     }]
   })
@@ -649,6 +647,29 @@ server.prompt(
 2. Identify Kerberos authentication attempts
 3. Extract any hashed credentials
 4. Provide security recommendations for credential handling`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'monitor_scan_prompt',
+  {
+    interface: z.string().optional().describe('WiFi interface to use'),
+    channel: z.number().optional().describe('WiFi channel (0 for auto)'),
+    duration: z.number().optional().describe('Capture duration in seconds'),
+  },
+  ({ interface: iface = 'wlo1', channel = 0, duration = 30 }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please perform a monitor mode scan on interface ${iface} (channel: ${channel === 0 ? 'auto' : channel}, duration: ${duration}s) and analyze:
+1. All WiFi clients detected with their MAC addresses and vendors
+2. Which access points they are connected to
+3. Signal strength analysis
+4. Any interesting SSIDs being probed by devices
+5. Generate a full HTML report`
       }
     }]
   })
