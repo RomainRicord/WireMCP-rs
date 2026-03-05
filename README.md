@@ -1,128 +1,160 @@
 ![Wire-MCP Banner](Wire-MCP.png)
 
+# WireMCP-rs
 
-# WireMCP
-WireMCP is a Model Context Protocol (MCP) server designed to empower Large Language Models (LLMs) with real-time network traffic analysis capabilities. By leveraging tools built on top of Wireshark's `tshark`, WireMCP captures and processes live network data, providing LLMs with structured context to assist in tasks like threat hunting, network diagnostics, and anomaly detection.
+MCP server for real-time network analysis — live packet capture, WiFi monitor mode scanning, threat detection — powered by native Rust parsing.
 
-# Features
-WireMCP exposes the following tools to MCP clients, enhancing LLM understanding of network activity:
+Forked from [0xKoda/WireMCP](https://github.com/0xKoda/WireMCP) and rewritten with Rust backends for performance (60x faster than tshark on packet parsing).
 
-- **`capture_packets`**: Captures live traffic and returns raw packet data as JSON, enabling LLMs to analyze packet-level details (e.g., IP addresses, ports, HTTP methods).
-- **`get_summary_stats`**: Provides protocol hierarchy statistics, giving LLMs an overview of traffic composition (e.g., TCP vs. UDP usage).
-- **`get_conversations`**: Delivers TCP/UDP conversation statistics, allowing LLMs to track communication flows between endpoints.
-- **`check_threats`**: Captures IPs and checks them against the URLhaus blacklist, equipping LLMs with threat intelligence context for identifying malicious activity.
-- **`check_ip_threats`**: Performs targeted threat intelligence lookups for specific IP addresses against multiple threat feeds, providing detailed reputation and threat data.
-- **`analyze_pcap`**: Analyzes PCAP files to provide comprehensive packet data in JSON format, enabling detailed post-capture analysis of network traffic.
-- **`extract_credentials`**: Scans PCAP files for potential credentials from various protocols (HTTP Basic Auth, FTP, Telnet), aiding in security audits and forensic analysis.
+## Features
 
+### MCP Tools
 
-## How It Helps LLMs
-WireMCP bridges the gap between raw network data and LLM comprehension by:
-- **Contextualizing Traffic**: Converts live packet captures into structured outputs (JSON, stats) that LLMs can parse and reason about.
-- **Threat Detection**: Integrates IOCs (currently URLhaus) to flag suspicious IPs, enhancing LLM-driven security analysis.
-- **Diagnostics**: Offers detailed traffic insights, enabling LLMs to assist with troubleshooting or identifying anomalies.
-- **Narrative Generation**: LLM's can Transform complex packet captures into coherent stories, making network analysis accessible to non-technical users.
+| Tool | Description | Backend |
+|------|-------------|---------|
+| **`capture_packets`** | Live packet capture with JSON output. Modes: `basic` (native Rust) or `full` (tshark deep dissection) | Rust |
+| **`get_summary_stats`** | Protocol hierarchy statistics (eth, ip, tcp, udp, dns, tls, http...) | Rust |
+| **`get_conversations`** | TCP/UDP conversation tracking with bytes, packets, duration per flow | Rust |
+| **`check_threats`** | Capture IPs and check against URLhaus blacklist | Rust + JS |
+| **`check_ip_threats`** | Check a specific IP against URLhaus IOCs | JS |
+| **`analyze_pcap`** | Analyze existing PCAP files. Modes: `basic` or `full` | Rust |
+| **`extract_credentials`** | Extract credentials from PCAP (HTTP Basic, FTP, Telnet, Kerberos hashes) | tshark |
+| **`monitor_scan`** | WiFi monitor mode scan with HTML report (clients, vendors, WiFi standards, signal) | Rust |
 
-# Installation
+### Native Rust Parsing (basic mode)
 
-## Prerequisites
-- Mac / Windows / Linux
-- [Wireshark](https://www.wireshark.org/download.html) (with `tshark` installed and accessible in PATH)
-- Node.js (v16+ recommended)
-- npm (for dependency installation)
+The `capture-rs` binary parses packets natively without tshark:
 
-## Setup
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/0xkoda/WireMCP.git
-   cd WireMCP
-   ```
+- **Ethernet** (MAC addresses, VLAN 802.1Q)
+- **IPv4 / IPv6** (addresses, TTL, hop limit)
+- **TCP** (ports, flags SYN/ACK/FIN/RST/PSH, seq, ack, window)
+- **UDP** (ports, length)
+- **ICMP** (type, code, description)
+- **ARP** (request/reply, MACs, IPs)
+- **DNS** (queries, responses with A/AAAA/CNAME records, name compression)
+- **TLS** (SNI from ClientHello, version 1.0-1.3 via Supported Versions extension)
+- **HTTP/1.x** (method, URI, Host, User-Agent, status, Content-Type, Server)
+- **DHCP** (message type, hostname, vendor class, assigned IP)
 
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+### WiFi Monitor Mode (monitor-scan-rs)
 
-3. Run the MCP server:
-   ```bash
-   node index.js
-   ```
+The `monitor-scan-rs` binary handles 802.11 monitor mode:
 
-> **Note**: Ensure `tshark` is in your PATH. WireMCP will auto-detect it or fall back to common install locations (e.g., `/Applications/Wireshark.app/Contents/MacOS/tshark` on macOS).
+- Switches interface to monitor mode, captures, then restores managed mode
+- Native radiotap header parsing (signal, data rate, MCS/VHT)
+- 802.11 frame parsing with IE extraction (HT/VHT/HE for WiFi 4/5/6 detection)
+- Auto channel detection (scans 2.4GHz + 5GHz channels)
+- Generates a styled HTML report with:
+  - Client table (MAC, vendor, WiFi standard, signal, AP, probes)
+  - Statistics (vendor distribution, WiFi standards, AP distribution)
+  - Signal strength bars, randomized MAC detection, power save status
 
-# Usage with MCP Clients
+## Installation
 
-WireMCP works with any MCP-compliant client. Below are examples for popular clients:
+### Prerequisites
 
-## Example 1: Cursor
+- Linux (tested on Fedora)
+- [Wireshark](https://www.wireshark.org/download.html) (`tshark` in PATH — only needed for `full` mode and `extract_credentials`)
+- Node.js (v16+)
+- Rust toolchain (`cargo`)
+- `libpcap-dev` / `libpcap-devel`
 
-Edit `mcp.json` in Cursor -> Settings -> MCP :
+### Setup
+
+```bash
+git clone https://github.com/RomainRicord/WireMCP-rs.git
+cd WireMCP-rs
+
+# Install Node dependencies
+npm install
+
+# Build Rust binaries
+cd capture-rs && cargo build --release && cd ..
+cd monitor-scan-rs && cargo build --release && cd ..
+
+# Set network capabilities (required for live capture without root)
+sudo setcap cap_net_raw,cap_net_admin=eip capture-rs/target/release/capture-packets
+sudo setcap cap_net_raw,cap_net_admin=eip monitor-scan-rs/target/release/monitor-scan
+```
+
+> **Note:** `setcap` must be re-run after each `cargo build --release`.
+
+### Sudoers (for monitor mode)
+
+Monitor mode requires `sudo` for `ip`, `iw`, and `nmcli`. Add to `/etc/sudoers`:
+
+```
+your_user ALL=(ALL) NOPASSWD: /usr/sbin/ip, /usr/sbin/iw
+```
+
+### Run
+
+```bash
+node index.js
+```
+
+## Usage with MCP Clients
+
+### Claude Desktop / Cursor
+
+Add to your MCP config:
 
 ```json
 {
   "mcpServers": {
-    "wiremcp": {
+    "wiremcp-rs": {
       "command": "node",
-      "args": [
-        "/ABSOLUTE_PATH_TO/WireMCP/index.js"
-      ]
+      "args": ["/path/to/WireMCP-rs/index.js"]
     }
   }
 }
 ```
 
-**Location (macOS)**: `/Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json`
+### Standalone CLI (no MCP)
 
-## Other Clients
+The monitor scan can also be used without MCP/LLM:
 
-This MCP will work well with any client. Use the command `node /path/to/WireMCP/index.js` in their MCP server settings.
+```bash
+# Node.js CLI
+node monitor-scan.js --interface wlo1 --channel 0 --duration 30 --output report.html
 
-# Example Output
+# Or directly with the Rust binary
+./monitor-scan-rs/target/release/monitor-scan --interface wlo1 --channel 0 --duration 30 --output report.html
 
-Running `check_threats` might yield:
-
-```
-Captured IPs:
-174.67.0.227
-52.196.136.253
-
-Threat check against URLhaus blacklist:
-No threats detected in URLhaus blacklist.
+# Packet capture
+./capture-rs/target/release/capture-packets --interface wlo1 --duration 5 --mode basic
+./capture-rs/target/release/capture-packets --mode stats --file capture.pcap
+./capture-rs/target/release/capture-packets --mode conversations --interface wlo1 --duration 10
 ```
 
-Running `analyze_pcap` on a capture file:
+## Performance
 
-```json
-{
-  "content": [{
-    "type": "text",
-    "text": "Analyzed PCAP: ./capture.pcap\n\nUnique IPs:\n192.168.0.2\n192.168.0.1\n\nProtocols:\neth:ethertype:ip:tcp\neth:ethertype:ip:tcp:telnet\n\nPacket Data:\n[{\"layers\":{\"frame.number\":[\"1\"],\"ip.src\":[\"192.168.0.2\"],\"ip.dst\":[\"192.168.0.1\"],\"tcp.srcport\":[\"1550\"],\"tcp.dstport\":[\"23\"]}}]"
-  }]
-}
+| Operation | tshark (JS) | Rust native | Speedup |
+|-----------|-------------|-------------|---------|
+| Parse 125 packets | 0.124s | 0.002s | **60x** |
+| Monitor scan (15k frames) | 1.33s CPU | 0.13s CPU | **10x** |
+| Binary size | — | 859K (stripped) | — |
+
+## Architecture
+
+```
+WireMCP-rs/
+  index.js              # MCP server (8 tools, prompts)
+  monitor-scan.js       # Standalone monitor mode CLI
+  capture-rs/           # Rust: packet capture + parsing
+    src/main.rs         #   Modes: basic, full, stats, conversations
+  monitor-scan-rs/      # Rust: WiFi monitor mode scanner
+    src/main.rs         #   802.11 parsing, HTML report generation
 ```
 
-
-LLMs can use these outputs to:
-- Provide natural language explanations of network activity
-- Identify patterns and potential security concerns
-- Offer context-aware recommendations
-- Generate human-readable reports
-
-# Roadmap
-
-- **Expand IOC Providers**: Currently uses URLhaus for threat checks. Future updates will integrate additional sources (e.g., IPsum, Emerging Threats) for broader coverage.
-
-
-# Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-# License
+## License
 
 [MIT](LICENSE)
 
-# Acknowledgments
+## Acknowledgments
 
-- Wireshark/tshark team for their excellent packet analysis tools
-- Model Context Protocol community for the framework and specifications
-- URLhaus for providing threat intelligence data
+- [0xKoda/WireMCP](https://github.com/0xKoda/WireMCP) — original project
+- Wireshark/tshark — deep protocol dissection
+- [pcap crate](https://crates.io/crates/pcap) — Rust libpcap bindings
+- URLhaus — threat intelligence data
+- Model Context Protocol — framework and specifications
