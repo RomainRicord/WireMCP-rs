@@ -1,4 +1,4 @@
-![Wire-MCP Banner](Wire-MCP.png)
+![Wire-MCP Banner](wiremcp-rs.png)
 
 # WireMCP-rs
 
