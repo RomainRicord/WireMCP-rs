@@ -28,6 +28,8 @@ pub fn proto_name(n: u8) -> &'static str {
     match n { 1 => "icmp", 6 => "tcp", 17 => "udp", 58 => "icmpv6", _ => "other" }
 }
 
+/// IPv4 fragment with offset > 0: its payload is the middle of a datagram, not an L4 header.
+pub fn ipv4_non_first_frag(ip: &[u8]) -> bool { ip.len() >= 8 && (u16be(ip, 6) & 0x1FFF) > 0 }
 pub fn pct(n: u64, total: u64) -> f64 { if total > 0 { n as f64 / total as f64 * 100.0 } else { 0.0 } }
 
 // --- Packet info builder ---
@@ -130,6 +132,12 @@ fn parse_ipv4(p: &mut Pkt, data: &[u8]) {
 
     let payload_end = total_len.min(data.len());
     let payload = &data[ihl..payload_end.max(ihl)];
+
+    if ipv4_non_first_frag(data) {
+        p.num("ip_frag_off", (u16be(data, 6) & 0x1FFF) as u32 * 8);
+        p.str("ip_proto", proto_name(proto));
+        return;
+    }
 
     match proto {
         1 => parse_icmp(p, payload),
@@ -518,5 +526,53 @@ fn parse_dhcp(p: &mut Pkt, data: &[u8]) {
             _ => {}
         }
         off += 2 + len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ethernet + IPv4 frame around an L4 payload
+    fn ipv4_frame(proto: u8, frag_field: u16, l4: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00]);
+        let total = (20 + l4.len()) as u16;
+        f.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 1,
+            (frag_field >> 8) as u8, frag_field as u8, 64, proto, 0, 0, 8, 8, 8, 8, 10, 0, 0, 1]);
+        f.extend_from_slice(l4);
+        f
+    }
+
+    fn udp(sp: u16, dp: u16, payload: &[u8]) -> Vec<u8> {
+        let len = (8 + payload.len()) as u16;
+        let mut u = vec![(sp >> 8) as u8, sp as u8, (dp >> 8) as u8, dp as u8, (len >> 8) as u8, len as u8, 0, 0];
+        u.extend_from_slice(payload);
+        u
+    }
+
+    #[test]
+    fn dns_answers_follow_all_questions() {
+        let mut dns = vec![0x12, 0x34, 0x81, 0x80, 0, 2, 0, 1, 0, 0, 0, 0];
+        for name in [&b"\x01a\x03com\x00"[..], &b"\x01b\x03com\x00"[..]] {
+            dns.extend_from_slice(name);
+            dns.extend_from_slice(&[0, 1, 0, 1]); // A, IN
+        }
+        // Answer: pointer to first name, A, IN, TTL 60, 9.9.9.9
+        dns.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 9, 9, 9, 9]);
+        let out = parse_packet(&ipv4_frame(17, 0, &udp(53, 40000, &dns)), 1, 0.0).unwrap();
+        assert!(out.contains(r#""dns_query":"a.com""#), "{out}");
+        assert!(out.contains(r#""dns_answers":"9.9.9.9""#), "{out}");
+    }
+
+    #[test]
+    fn non_first_fragment_has_no_ports() {
+        // Offset 185*8 = 1480: payload is the middle of a datagram, bytes must not be read as ports
+        let out = parse_packet(&ipv4_frame(17, 185, &[0xAB; 64]), 1, 0.0).unwrap();
+        assert!(out.contains(r#""ip_frag_off": 1480"#), "{out}");
+        assert!(!out.contains("udp_sp"), "{out}");
+
+        let first = parse_packet(&ipv4_frame(17, 0x2000, &udp(53, 40000, &[0; 16])), 1, 0.0).unwrap();
+        assert!(first.contains(r#""udp_sp": 53"#), "{first}");
     }
 }

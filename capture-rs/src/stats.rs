@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::Cli;
-use crate::parsers::{u16be, ip4_fmt, ip6_fmt};
+use crate::parsers::{u16be, ip4_fmt, ip6_fmt, ipv4_non_first_frag};
 use crate::capture::capture_basic;
 
 // --- Stats mode: protocol hierarchy ---
@@ -29,7 +29,8 @@ pub fn run_stats(cli: &Cli) {
                 chain.push("ip");
                 let ihl = (payload[0] & 0x0F) as usize * 4;
                 let proto = payload[9];
-                let app_payload = if ihl < payload.len() { &payload[ihl..] } else { &[] };
+                // Non-first fragments carry no L4 header: count the protocol, skip port-based app detection
+                let app_payload = if ihl < payload.len() && !ipv4_non_first_frag(payload) { &payload[ihl..] } else { &[] };
                 match proto {
                     6 => { chain.push("tcp"); detect_app(&mut chain, app_payload, true); }
                     17 => { chain.push("udp"); detect_app(&mut chain, app_payload, false); }
@@ -124,6 +125,7 @@ pub fn run_conversations(cli: &Cli) {
 
         let (src_ip, dst_ip, proto, ip_payload) = match ethertype {
             0x0800 if payload.len() >= 20 => {
+                if ipv4_non_first_frag(payload) { return; } // no ports to attribute
                 let ihl = (payload[0] & 0x0F) as usize * 4;
                 (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]), payload[9], &payload[ihl.min(payload.len())..])
             }

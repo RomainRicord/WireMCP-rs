@@ -1,30 +1,44 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Cli;
-use crate::parsers::{u16be, ip4_fmt, ip6_fmt, dns_name, pct};
+use crate::parsers::{u16be, ip4_fmt, ip6_fmt, dns_name, pct, ipv4_non_first_frag};
 use crate::capture::capture_basic;
 
-// Amplification protocol table: (name, port, max_amplification_factor)
-const AMP_PROTOCOLS: &[(&str, u16, &str)] = &[
-    ("DNS",           53,    "x54000"),
-    ("NTP",           123,   "x556"),
-    ("SSDP/UPnP",    1900,  "x30"),
-    ("SNMP",          161,   "x6.3"),
-    ("Chargen",       19,    "x358"),
-    ("Memcached",     11211, "x51000"),
-    ("CLDAP",         389,   "x70"),
-    ("NetBIOS",       137,   "x3.8"),
-    ("RPC Portmap",   111,   "x7"),
-    ("Steam",         27015, "x5.5"),
-    ("ARMS",          3283,  "x35"),
-    ("WS-Discovery",  3702,  "x500"),
-    ("CoAP",          5683,  "x34"),
-    ("Jenkins",       33848, "x100"),
+// Amplification protocol table: (name, port, max_amplification_factor, min_reflectors)
+// min_reflectors: distinct sources answering from that port before we call it reflection.
+// VPN ports need a high value: a single IPsec server legitimately sends far more than it receives.
+const AMP_PROTOCOLS: &[(&str, u16, &str, usize)] = &[
+    ("DNS",           53,    "x54000", 3),
+    ("NTP",           123,   "x556",   3),
+    ("SSDP/UPnP",    1900,  "x30",    3),
+    ("SNMP",          161,   "x6.3",   3),
+    ("Chargen",       19,    "x358",   3),
+    ("Memcached",     11211, "x51000", 3),
+    ("CLDAP",         389,   "x70",    3),
+    ("NetBIOS",       137,   "x3.8",   3),
+    ("RPC Portmap",   111,   "x7",     3),
+    ("Steam",         27015, "x5.5",   3),
+    ("ARMS",          3283,  "x35",    3),
+    ("WS-Discovery",  3702,  "x500",   3),
+    ("CoAP",          5683,  "x34",    3),
+    ("Jenkins",       33848, "x100",   3),
+    ("Ubiquiti Discovery", 10001, "x35", 3),
+    ("Dahua DHDiscover",   37810, "n/a", 3),
+    ("BACnet",        47808, "n/a",    3),
+    ("IKE/IPsec",     500,   "n/a",    10),
+    ("IKE/IPsec NAT-T", 4500, "n/a",   10),
 ];
+
+fn is_amp_port(port: u16) -> bool {
+    AMP_PROTOCOLS.iter().any(|&(_, p, _, _)| p == port)
+}
+
+// Protocols that legitimately carry tunnels/routing and must not count as "random protocol" noise
+const KNOWN_IP_PROTOS: &[u8] = &[1, 2, 4, 6, 17, 41, 47, 50, 51, 58, 89, 103, 112, 132];
 
 struct SrcStats {
     pkts: u64, bytes: u64,
-    syn_count: u64, ack_only_count: u64, rst_count: u64, fin_count: u64, psh_count: u64,
+    syn_count: u64, synack_count: u64, ack_only_count: u64, rst_count: u64, fin_count: u64, psh_count: u64,
     udp_count: u64, icmp_count: u64, tcp_count: u64,
     dst_ports: HashMap<u16, u64>,
     first_seen: f64, last_seen: f64,
@@ -36,16 +50,17 @@ struct SrcStats {
     // TCP connection tracking
     small_tcp_pkts: u64,  // packets < 100 bytes (slowloris indicator)
     tcp_connections: HashSet<u16>, // unique dst ports with SYN
+    svc_src_pkts: u64, // TCP/UDP packets sent *from* a well-known/amp port (responses, not scans)
 }
 
 impl SrcStats {
     fn new(t: f64) -> Self {
-        Self { pkts: 0, bytes: 0, syn_count: 0, ack_only_count: 0, rst_count: 0,
+        Self { pkts: 0, bytes: 0, syn_count: 0, synack_count: 0, ack_only_count: 0, rst_count: 0,
                fin_count: 0, psh_count: 0, udp_count: 0, icmp_count: 0, tcp_count: 0,
                dst_ports: HashMap::new(), first_seen: t, last_seen: t,
                http_gets: 0, http_posts: 0, http_other: 0,
                unique_uris: HashSet::new(), user_agents: HashSet::new(),
-               xmlrpc_hits: 0, small_tcp_pkts: 0, tcp_connections: HashSet::new() }
+               xmlrpc_hits: 0, small_tcp_pkts: 0, tcp_connections: HashSet::new(), svc_src_pkts: 0 }
     }
     fn rate(&self) -> f64 {
         let d = self.last_seen - self.first_seen;
@@ -54,7 +69,10 @@ impl SrcStats {
 }
 
 #[derive(Default)]
-struct AmpStats { requests: u64, req_bytes: u64, responses: u64, resp_bytes: u64 }
+struct AmpStats { requests: u64, req_bytes: u64, responses: u64, resp_bytes: u64, reflectors: HashSet<String> }
+
+// UDP traffic received on one (dst ip, dst port)
+struct UdpSink { pkts: u64, bytes: u64, sizes: HashMap<u64, u64>, srcs: HashSet<String>, first: f64, last: f64 }
 impl AmpStats {
     fn ratio(&self) -> f64 {
         if self.req_bytes > 0 { self.resp_bytes as f64 / self.req_bytes as f64 } else if self.resp_bytes > 0 { f64::INFINITY } else { 0.0 }
@@ -67,7 +85,7 @@ pub fn run_ddos(cli: &Cli) {
 
     // Amplification tracking per protocol per target
     let mut amp_data: HashMap<u16, HashMap<String, AmpStats>> = HashMap::new();
-    for &(_, port, _) in AMP_PROTOCOLS { amp_data.insert(port, HashMap::new()); }
+    for &(_, port, _, _) in AMP_PROTOCOLS { amp_data.insert(port, HashMap::new()); }
 
     // DNS carpet bombing: track queried domains
     let mut dns_queries: HashMap<String, u64> = HashMap::new(); // base domain -> count
@@ -85,6 +103,9 @@ pub fn run_ddos(cli: &Cli) {
     let mut frag_count = 0u64;
     let mut total_http_req = 0u64;
     let mut http_dst_ips: HashMap<String, u64> = HashMap::new();
+    let mut synack_same_port = 0u64;
+    let mut other_protos: HashMap<u8, u64> = HashMap::new();
+    let mut udp_sinks: HashMap<(String, u16), UdpSink> = HashMap::new();
 
     capture_basic(cli, |data, time| {
         total_pkts += 1;
@@ -100,15 +121,17 @@ pub fn run_ddos(cli: &Cli) {
             let et = u16be(payload, 2); payload = &payload[4..]; et
         } else { ethertype };
 
-        let (src_ip, dst_ip, proto, ip_payload) = match ethertype {
+        // non_first_frag: IPv4 fragment with offset > 0, carries no L4 header
+        let (src_ip, dst_ip, proto, ip_payload, non_first_frag) = match ethertype {
             0x0800 if payload.len() >= 20 => {
                 let ihl = (payload[0] & 0x0F) as usize * 4;
                 let flags = u16be(payload, 6);
                 if (flags & 0x2000) != 0 || (flags & 0x1FFF) > 0 { frag_count += 1; }
-                (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]), payload[9], &payload[ihl.min(payload.len())..])
+                (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]), payload[9], &payload[ihl.min(payload.len())..],
+                 ipv4_non_first_frag(payload))
             }
             0x86DD if payload.len() >= 40 =>
-                (ip6_fmt(&payload[8..24]), ip6_fmt(&payload[24..40]), payload[6], &payload[40..]),
+                (ip6_fmt(&payload[8..24]), ip6_fmt(&payload[24..40]), payload[6], &payload[40..], false),
             _ => return,
         };
 
@@ -118,6 +141,17 @@ pub fn run_ddos(cli: &Cli) {
 
         let s = sources.entry(src_ip.clone()).or_insert_with(|| SrcStats::new(time));
         s.pkts += 1; s.bytes += pkt_len; s.last_seen = time;
+
+        // Count the protocol, but don't read ports/flags out of fragment payload bytes
+        if non_first_frag {
+            match proto {
+                6 => s.tcp_count += 1,
+                17 => s.udp_count += 1,
+                1 | 58 => s.icmp_count += 1,
+                other => *other_protos.entry(other).or_default() += 1,
+            }
+            return;
+        }
 
         match proto {
             6 if ip_payload.len() >= 20 => { // TCP
@@ -133,7 +167,12 @@ pub fn run_ddos(cli: &Cli) {
                 let is_psh = (flags & 0x08) != 0;
 
                 if is_syn && !is_ack { s.syn_count += 1; total_syn += 1; s.tcp_connections.insert(dp); }
-                if is_syn && is_ack { total_synack += 1; }
+                if is_syn && is_ack {
+                    s.synack_count += 1; total_synack += 1;
+                    // A real SYN-ACK goes back to the client's ephemeral port; sp == dp means the SYN was spoofed
+                    if sp == dp { synack_same_port += 1; }
+                }
+                if sp < 1024 { s.svc_src_pkts += 1; }
                 if is_ack && !is_syn && !is_rst && !is_fin && !is_psh { s.ack_only_count += 1; total_ack_only += 1; }
                 if is_rst { s.rst_count += 1; total_rst += 1; }
                 if is_fin { s.fin_count += 1; total_fin += 1; }
@@ -181,14 +220,23 @@ pub fn run_ddos(cli: &Cli) {
                 let sp = u16be(ip_payload, 0);
                 let dp = u16be(ip_payload, 2);
                 *s.dst_ports.entry(dp).or_default() += 1;
+                if sp < 1024 || is_amp_port(sp) { s.svc_src_pkts += 1; }
+
+                let sink = udp_sinks.entry((dst_ip.clone(), dp)).or_insert_with(|| UdpSink {
+                    pkts: 0, bytes: 0, sizes: HashMap::new(), srcs: HashSet::new(), first: time, last: time });
+                sink.pkts += 1; sink.bytes += pkt_len; sink.last = time;
+                *sink.sizes.entry(pkt_len).or_default() += 1;
+                if !sink.srcs.contains(&src_ip) { sink.srcs.insert(src_ip.clone()); }
 
                 // Check all amplification protocols
-                for &(_, port, _) in AMP_PROTOCOLS {
+                for &(_, port, _, _) in AMP_PROTOCOLS {
                     if sp == port || dp == port {
                         if let Some(map) = amp_data.get_mut(&port) {
                             let e = map.entry(dst_ip.clone()).or_default();
-                            if sp == port { e.responses += 1; e.resp_bytes += pkt_len; }
-                            else { e.requests += 1; e.req_bytes += pkt_len; }
+                            if sp == port {
+                                e.responses += 1; e.resp_bytes += pkt_len;
+                                if !e.reflectors.contains(&src_ip) { e.reflectors.insert(src_ip.clone()); }
+                            } else { e.requests += 1; e.req_bytes += pkt_len; }
                         }
                     }
                 }
@@ -209,7 +257,8 @@ pub fn run_ddos(cli: &Cli) {
                 }
             }
             1 | 58 => { s.icmp_count += 1; }
-            _ => {}
+            6 | 17 => {} // truncated TCP/UDP header
+            other => { *other_protos.entry(other).or_default() += 1; }
         }
     });
 
@@ -251,16 +300,27 @@ pub fn run_ddos(cli: &Cli) {
     let icmp_total: u64 = sources.values().map(|s| s.icmp_count).sum();
 
     println!("[L3/L4 Flood Analysis]");
-    println!("  TCP: {} ({:.1}%)  UDP: {} ({:.1}%)  ICMP: {} ({:.1}%)",
-        tcp_total, pct(tcp_total, total_pkts), udp_total, pct(udp_total, total_pkts), icmp_total, pct(icmp_total, total_pkts));
+    let other_total: u64 = other_protos.values().sum();
+    println!("  TCP: {} ({:.1}%)  UDP: {} ({:.1}%)  ICMP: {} ({:.1}%)  Other: {} ({:.1}%)",
+        tcp_total, pct(tcp_total, total_pkts), udp_total, pct(udp_total, total_pkts), icmp_total, pct(icmp_total, total_pkts),
+        other_total, pct(other_total, total_pkts));
     println!("  TCP flags — SYN:{} SYN+ACK:{} ACK-only:{} RST:{} FIN:{}",
         total_syn, total_synack, total_ack_only, total_rst, total_fin);
 
     // SYN Flood — require multiple sources to avoid asymmetric capture false positives
     let syn_ratio = if total_synack > 0 { total_syn as f64 / total_synack as f64 } else if total_syn > 0 { f64::INFINITY } else { 0.0 };
     let syn_sources: usize = sources.values().filter(|s| s.syn_count > 0).count();
-    if total_syn > 100 && syn_ratio > 3.0 && syn_sources > 5 {
+    if total_syn > 100 && syn_ratio > 3.0 && syn_sources > 5 && total_syn as f64 / duration > 50.0 {
         let msg = format!("SYN Flood: {} SYN from {} sources, ratio SYN/SYN+ACK={:.1} (normal~1.0)", total_syn, syn_sources, syn_ratio);
+        println!("  >> {}", msg); alerts.push(msg);
+    }
+    // SYN-ACK reflection — the target receives SYN-ACKs for SYNs it never sent (spoofed by the attacker)
+    let synack_sources: usize = sources.values().filter(|s| s.synack_count > 0).count();
+    if total_synack > 100 && total_synack > total_syn.max(1) * 3 && synack_sources > 20 {
+        let msg = format!("TCP SYN-ACK Reflection: {} SYN-ACK from {} reflectors vs {} SYN sent", total_synack, synack_sources, total_syn);
+        println!("  >> {}", msg); alerts.push(msg);
+    } else if synack_same_port > 100 && pct(synack_same_port, total_synack) > 30.0 && synack_sources > 5 {
+        let msg = format!("TCP SYN-ACK Reflection (same-port): {} SYN-ACK with src port == dst port from {} reflectors", synack_same_port, synack_sources);
         println!("  >> {}", msg); alerts.push(msg);
     }
     // ACK Flood — only flag if: high ACK ratio + many sources (distributed) + low payload ratio
@@ -284,6 +344,25 @@ pub fn run_ddos(cli: &Cli) {
         let msg = format!("UDP Flood: {:.0}% UDP at {:.0} pkt/s, {} sources", pct(udp_total, total_pkts), pps, udp_sources);
         println!("  >> {}", msg); alerts.push(msg);
     }
+    // Uniform-size UDP flood — many packets of one fixed size from several sources to a single port.
+    // Real traffic (VPN, QUIC, games) has varying sizes; size >= 500 excludes fixed-size VoIP codecs.
+    for ((ip, port), sink) in &udp_sinks {
+        let dur = (sink.last - sink.first).max(1.0);
+        let (&size, &count) = match sink.sizes.iter().max_by_key(|(_, &c)| c) { Some(x) => x, None => continue };
+        if sink.pkts > 2000 && sink.pkts as f64 / dur > 300.0 && size >= 500
+            && pct(count, sink.pkts) > 95.0 && sink.srcs.len() >= 3 {
+            let msg = format!("Uniform-size UDP Flood: {}:{} — {} packets of {} B ({:.0}%) from {} sources at {:.0} pkt/s",
+                ip, port, sink.pkts, size, pct(count, sink.pkts), sink.srcs.len(), sink.pkts as f64 / dur);
+            println!("  >> {}", msg); alerts.push(msg);
+        }
+    }
+    // IP protocol flood — packets cycling through many unusual IP protocol numbers
+    let odd_protos = other_protos.keys().filter(|p| !KNOWN_IP_PROTOS.contains(p)).count();
+    if other_total > 100 && pct(other_total, total_pkts) > 50.0 && odd_protos > 10 {
+        let msg = format!("IP Protocol Flood: {} packets ({:.0}%) using {} distinct IP protocol numbers",
+            other_total, pct(other_total, total_pkts), odd_protos);
+        println!("  >> {}", msg); alerts.push(msg);
+    }
     // ICMP Flood — require high packet rate to avoid monitoring/traceroute false positives
     let icmp_pps = icmp_total as f64 / duration;
     if icmp_total > 50 && pct(icmp_total, total_pkts) > 50.0 && icmp_pps > 50.0 {
@@ -300,14 +379,15 @@ pub fn run_ddos(cli: &Cli) {
     // --- Amplification Detection (all protocols) ---
     println!("[Amplification/Reflection Analysis]");
     let mut any_amp = false;
-    for &(name, port, max_factor) in AMP_PROTOCOLS {
+    for &(name, port, max_factor, min_reflectors) in AMP_PROTOCOLS {
         if let Some(map) = amp_data.get(&port) {
-            let suspicious: Vec<_> = map.iter().filter(|(_, a)| a.resp_bytes > a.req_bytes.max(1) * 3 && a.responses > 5).collect();
+            let suspicious: Vec<_> = map.iter().filter(|(_, a)| a.resp_bytes > a.req_bytes.max(1) * 3 && a.responses > 5
+                && a.reflectors.len() >= min_reflectors).collect();
             for (ip, a) in &suspicious {
                 any_amp = true;
                 let r = a.ratio();
-                let msg = format!("{} Amplification: target={} — {} resp ({} B) vs {} req ({} B) — {:.1}x (max {})",
-                    name, ip, a.responses, a.resp_bytes, a.requests, a.req_bytes, r, max_factor);
+                let msg = format!("{} Amplification: target={} — {} resp ({} B) from {} reflectors vs {} req ({} B) — {:.1}x (max {})",
+                    name, ip, a.responses, a.resp_bytes, a.reflectors.len(), a.requests, a.req_bytes, r, max_factor);
                 println!("  >> {}", msg); alerts.push(msg);
             }
         }
@@ -409,11 +489,13 @@ pub fn run_ddos(cli: &Cli) {
     }
 
     // --- Port Scan / Scattershot ---
-    let scanners: Vec<_> = sources.iter().filter(|(_, s)| s.dst_ports.len() > 100 && s.pkts > 200 && s.rate() > 50.0).collect();
+    // Skip sources that mostly answer from a service/amp port: reflectors hit random ports but aren't scanning
+    let scanners: Vec<_> = sources.iter().filter(|(_, s)| s.dst_ports.len() > 100 && s.pkts > 200 && s.rate() > 50.0
+        && s.svc_src_pkts * 2 < s.pkts).collect();
     if !scanners.is_empty() {
         println!("[Port Scan / Scattershot Detection]");
         for (ip, s) in &scanners {
-            let msg = format!("{} — {} ports scanned, {} packets ({:.0}/s)", ip, s.dst_ports.len(), s.pkts, s.rate());
+            let msg = format!("Port Scan: {} — {} ports scanned, {} packets ({:.0}/s)", ip, s.dst_ports.len(), s.pkts, s.rate());
             println!("  >> {}", msg); alerts.push(msg);
         }
         println!();
@@ -421,11 +503,12 @@ pub fn run_ddos(cli: &Cli) {
 
     // --- Multi-vector Detection ---
     let attack_types: Vec<&str> = alerts.iter().map(|a| {
-        if a.contains("SYN") { "SYN" } else if a.contains("ACK Flood") { "ACK" }
+        if a.contains("SYN-ACK Reflection") { "REFL" } else if a.contains("SYN") { "SYN" } else if a.contains("ACK Flood") { "ACK" }
         else if a.contains("RST") { "RST" } else if a.contains("UDP Flood") { "UDP" }
         else if a.contains("ICMP") { "ICMP" } else if a.contains("Amplification") { "AMP" }
         else if a.contains("HTTP") { "HTTP" } else if a.contains("DNS Carpet") { "DNS-CB" }
         else if a.contains("Slowloris") { "SLOW" } else if a.contains("Port Scan") { "SCAN" }
+        else if a.contains("IP Protocol Flood") { "IPPROTO" }
         else { "OTHER" }
     }).collect::<HashSet<_>>().into_iter().collect();
 

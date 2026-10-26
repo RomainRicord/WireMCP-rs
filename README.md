@@ -49,10 +49,15 @@ The `analyze_ddos` tool detects 25+ attack patterns from live traffic or PCAP fi
 - SYN Flood (SYN/SYN+ACK ratio analysis)
 - ACK Flood, RST Flood, FIN Flood
 - UDP Flood (volume-based detection)
+- Uniform-size UDP Flood (fixed-length random payload from a few sources)
 - ICMP Flood
-- IP Fragmentation attack
+- IP Protocol Flood (random IP protocol numbers)
+- IP Fragmentation attack (non-first fragments are never parsed as TCP/UDP headers)
 
-**Amplification/Reflection (14 protocols):**
+**Amplification/Reflection (19 protocols + TCP):**
+
+A protocol is flagged only when several distinct reflectors answer from its port (3, or 10 for IPsec ports),
+so a single DNS resolver or VPN server never triggers an alert.
 
 | Protocol | Port | Max Amplification |
 |----------|------|-------------------|
@@ -70,6 +75,13 @@ The `analyze_ddos` tool detects 25+ attack patterns from live traffic or PCAP fi
 | SNMP | 161 | x6.3 |
 | Steam | 27015 | x5.5 |
 | NetBIOS | 137 | x3.8 |
+| Ubiquiti Discovery | 10001 | x35 |
+| Dahua DHDiscover | 37810 | n/a |
+| BACnet | 47808 | n/a |
+| IKE/IPsec | 500 | n/a |
+| IKE/IPsec NAT-T | 4500 | n/a |
+
+- TCP SYN-ACK Reflection (SYN-ACKs for SYNs never sent, including the same-port variant)
 
 **L7 Application Layer:**
 - HTTP/S GET Flood
@@ -89,7 +101,7 @@ The `analyze_ddos` tool detects 25+ attack patterns from live traffic or PCAP fi
 **Meta Detection:**
 - Multi-vector attack detection (automatic identification of simultaneous attack types)
 - Distributed attack detection (many sources, high packet rate)
-- Port scan / Scattershot detection
+- Port scan / Scattershot detection (ignores reflectors answering from service ports)
 - Traffic timeline with per-second packet and bandwidth visualization
 
 ### Baseline Profiling & Anomaly Detection (create_baseline / detect_anomalies)
@@ -164,7 +176,7 @@ The `monitor-scan-rs` binary handles 802.11 monitor mode:
 
 - Linux (tested on Fedora, Debian)
 - [Wireshark](https://www.wireshark.org/download.html) (`tshark` in PATH — only needed for `full` mode and `extract_credentials`)
-- Node.js (v16+)
+- Node.js (v20+)
 - Rust toolchain (`cargo`)
 - `libpcap-dev` / `libpcap-devel`
 
@@ -250,6 +262,18 @@ BASELINE_FILE=baseline.json ./capture-rs/target/release/capture-packets --mode a
 # Source Engine game server monitoring
 SOURCE_PORT=27015 ./capture-rs/target/release/capture-packets --mode source-engine --interface eth0 --duration 120
 ```
+
+## Tests
+
+```bash
+cd capture-rs && cargo test --release
+```
+
+- Synthetic tests generate small pcaps on the fly: legitimate traffic (QUIC download, IPsec VPN, home DNS) must stay
+  silent, and edge cases (fragments, uniform UDP flood) must behave.
+- Dataset tests run the detector on the 18 real attacks of the
+  [StopDDoS packet-captures](https://github.com/StopDDoS/packet-captures) collection and check the expected alerts.
+  Download it into `packet-captures-main/` at the repo root (or set `WIREMCP_PCAP_DIR`); without it these tests are skipped.
 
 ## Performance
 
