@@ -544,7 +544,7 @@ server.tool(
   'Capture traffic and build a baseline profile of normal network behavior. Save as JSON for later anomaly detection. Run this during known-good conditions.',
   {
     interface: z.string().optional().default('eth0').describe('Network interface to capture from'),
-    duration: z.number().optional().default(60).describe('Capture duration in seconds (longer = better baseline)'),
+    duration: z.number().int().min(1).max(600).optional().default(60).describe('Capture duration in seconds (1-600, longer = better baseline)'),
     outputPath: z.string().optional().default('').describe('Output JSON file path (default: ./baseline.json)'),
   },
   async (args) => {
@@ -558,8 +558,8 @@ server.tool(
       const outputFile = args.outputPath || path.join(process.cwd(), 'baseline.json');
       console.error(`[create_baseline] Building profile on ${iface} for ${duration}s`);
       const env = { ...process.env, BASELINE_OUTPUT: outputFile };
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode baseline`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', 'baseline'],
         { timeout: (duration + 60) * 1000, env }
       );
       if (stderr) console.error(stderr);
@@ -576,7 +576,7 @@ server.tool(
   'Compare live traffic against a baseline profile to detect anomalies: new IPs, new ports, new protocols, DNS changes, traffic spikes, and behavioral deviations.',
   {
     interface: z.string().optional().default('eth0').describe('Network interface to capture from'),
-    duration: z.number().optional().default(30).describe('Monitoring duration in seconds'),
+    duration: z.number().int().min(1).max(600).optional().default(30).describe('Monitoring duration in seconds (1-600)'),
     baselinePath: z.string().optional().default('').describe('Path to baseline JSON file (default: ./baseline.json)'),
   },
   async (args) => {
@@ -593,8 +593,8 @@ server.tool(
       }
       console.error(`[detect_anomalies] Monitoring on ${iface} for ${duration}s against ${baselineFile}`);
       const env = { ...process.env, BASELINE_FILE: baselineFile };
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode anomaly`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', 'anomaly'],
         { timeout: (duration + 60) * 1000, env }
       );
       if (stderr) console.error(stderr);
@@ -611,7 +611,7 @@ server.tool(
   'Reassemble TCP streams and analyze payloads for threats: protocol mismatch, high entropy exfiltration, shell commands, C2 beacons, reverse shells, DNS tunneling, DGA domains. Live capture or PCAP file.',
   {
     interface: z.string().optional().default('eth0').describe('Network interface to capture from'),
-    duration: z.number().optional().default(15).describe('Capture duration in seconds'),
+    duration: z.number().int().min(1).max(300).optional().default(15).describe('Capture duration in seconds (1-300)'),
     pcapPath: z.string().optional().default('').describe('Analyze a PCAP file instead of live capture'),
   },
   async (args) => {
@@ -622,16 +622,16 @@ server.tool(
     try {
       const iface = sanitizeIface(args.interface);
       const duration = args.duration;
-      let cmd;
+      let cmdArgs;
       if (args.pcapPath) {
         await fs.access(args.pcapPath);
-        cmd = `${captureBin} --mode streams --file "${args.pcapPath}"`;
+        cmdArgs = ['--mode', 'streams', '--file', args.pcapPath];
         console.error(`[analyze_streams] Analyzing streams in ${args.pcapPath}`);
       } else {
-        cmd = `${captureBin} --mode streams --interface ${iface} --duration ${duration}`;
+        cmdArgs = ['--mode', 'streams', '--interface', iface, '--duration', String(duration)];
         console.error(`[analyze_streams] Analyzing streams on ${iface} for ${duration}s`);
       }
-      const { stdout, stderr } = await execAsync(cmd, { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(captureBin, cmdArgs, { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 });
       if (stderr) console.error(stderr);
       return { content: [{ type: 'text', text: `Stream analysis results:\n${stdout}` }] };
     } catch (error) {
@@ -646,8 +646,8 @@ server.tool(
   'Monitor Source Engine (Garry\'s Mod/CS/TF2) game server traffic for DDoS detection. Detects A2S query floods, amplification attacks, query-only bots, high-rate clients, periodic bots, fake players, traffic spikes, and distributed attacks.',
   {
     interface: z.string().optional().default('eth0').describe('Network interface to capture from'),
-    duration: z.number().optional().default(30).describe('Monitoring duration in seconds'),
-    serverPort: z.number().optional().default(27015).describe('Game server port to monitor'),
+    duration: z.number().int().min(1).max(600).optional().default(30).describe('Monitoring duration in seconds (1-600)'),
+    serverPort: z.number().int().min(1).max(65535).optional().default(27015).describe('Game server port to monitor'),
   },
   async (args) => {
     const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
@@ -657,10 +657,13 @@ server.tool(
     try {
       const iface = sanitizeIface(args.interface);
       const duration = args.duration;
-      const port = Math.max(1, Math.min(65535, Math.floor(args.serverPort)));
-      const cmd = `SOURCE_PORT=${port} ${captureBin} --mode source-engine --interface ${iface} --duration ${duration}`;
+      const port = args.serverPort;
+      const env = { ...process.env, SOURCE_PORT: String(port) };
       console.error(`[source_engine_monitor] Monitoring port ${port} on ${iface} for ${duration}s`);
-      const { stdout, stderr } = await execAsync(cmd, { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--mode', 'source-engine', '--interface', iface, '--duration', String(duration)],
+        { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024, env }
+      );
       if (stderr) console.error(stderr);
       return { content: [{ type: 'text', text: `Source Engine monitor results:\n${stdout}` }] };
     } catch (error) {
