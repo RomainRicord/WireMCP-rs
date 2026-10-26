@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::Cli;
-use crate::parsers::{u16be, u32be, ip4_fmt, ip6_fmt, dns_name, jesc};
+use crate::parsers::{u16be, u32be, ip4_fmt, ip6_fmt, dns_name, jesc, ipv4_non_first_frag};
 use crate::capture::capture_basic;
 
 /// TCP stream tracker
@@ -255,8 +255,9 @@ pub fn run_streams(cli: &Cli) {
         let (src_ip, dst_ip, proto, ip_payload) = match ethertype {
             0x0800 if payload.len() >= 20 => {
                 let ihl = (payload[0] & 0x0F) as usize * 4;
-                (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]),
-                 payload[9], &payload[ihl.min(payload.len())..])
+                // Non-first fragments carry no L4 header: empty payload so no ports are read
+                let l4 = if ipv4_non_first_frag(payload) { &payload[..0] } else { &payload[ihl.min(payload.len())..] };
+                (ip4_fmt(&payload[12..16]), ip4_fmt(&payload[16..20]), payload[9], l4)
             }
             0x86DD if payload.len() >= 40 => {
                 (ip6_fmt(&payload[8..24]), ip6_fmt(&payload[24..40]),
