@@ -60,8 +60,8 @@ pub fn run_stats(cli: &Cli) {
             *proto_bytes.entry(key.clone()).or_default() += len;
             *proto_pkts.entry(key).or_default() += 1;
         }
-        *proto_bytes.entry(full.clone()).or_default(); // ensure leaf exists
-        *proto_pkts.entry(full).or_default();
+        proto_bytes.entry(full.clone()).or_default(); // ensure leaf exists
+        proto_pkts.entry(full).or_default();
     });
 
     eprintln!("[stats] {} packets, {} bytes", total_pkts, total_bytes);

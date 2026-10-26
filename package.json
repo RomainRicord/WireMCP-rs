@@ -1,19 +1,25 @@
 {
-  "name": "wiremcp",
-  "version": "1.0.0",
-  "description": "An MCP for network sleuthing",
+  "name": "wiremcp-rs",
+  "version": "1.1.0",
+  "description": "MCP server for real-time network analysis with native Rust packet parsing",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "build": "cargo build --release --manifest-path capture-rs/Cargo.toml && cargo build --release --manifest-path monitor-scan-rs/Cargo.toml",
+    "check": "node --check index.js"
   },
-  "author": "0xKoda",
+  "author": "RomainRicord",
+  "contributors": [
+    "0xKoda (original WireMCP)"
+  ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
-    "axios": "^1.8.4",
-    "child_process": "^1.0.2",
-    "util": "^0.12.5",
-    "which": "^5.0.0",
-    "zod": "^3.24.2"
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "axios": "^1.20.0",
+    "which": "^7.0.0",
+    "zod": "^4.6.7"
   }
 }

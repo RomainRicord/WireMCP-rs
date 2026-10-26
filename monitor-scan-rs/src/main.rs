@@ -3,16 +3,17 @@ use pcap::Capture;
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-static mut INTERRUPTED: libc::c_int = 0;
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn is_interrupted() -> bool {
-    unsafe { std::ptr::read_volatile(&INTERRUPTED) != 0 }
+    INTERRUPTED.load(Ordering::SeqCst)
 }
 
 extern "C" fn sigint_handler(_sig: libc::c_int) {
-    unsafe { std::ptr::write_volatile(&mut INTERRUPTED, 1); }
+    INTERRUPTED.store(true, Ordering::SeqCst);
     let msg = b"\n[monitor-scan] Ctrl+C received, stopping...\n";
     unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
 }
@@ -633,7 +634,7 @@ fn main() {
     // Raw SIGINT handler — no SA_RESTART so poll() returns EINTR
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigint_handler as usize;
+        sa.sa_sigaction = sigint_handler as extern "C" fn(libc::c_int) as usize;
         sa.sa_flags = 0; // No SA_RESTART — poll/read will return EINTR
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());

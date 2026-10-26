@@ -274,22 +274,21 @@ fn parse_dns(p: &mut Pkt, data: &[u8]) {
 
     p.str("dns_type", if is_resp { "response" } else { "query" });
 
-    // Parse first question
+    // Walk all questions (so answers start at the right offset), report the first only
     let mut off = 12;
-    for _ in 0..qcount.min(4) {
-        if let Some((name, new_off)) = dns_name(data, off) {
-            if new_off + 4 > data.len() { break; }
+    for i in 0..qcount.min(16) {
+        let Some((name, new_off)) = dns_name(data, off) else { return };
+        if new_off + 4 > data.len() { return; }
+        if i == 0 {
             let qtype = u16be(data, new_off);
             let qtype_str = match qtype { 1 => "A", 28 => "AAAA", 5 => "CNAME", 15 => "MX", 16 => "TXT",
                 33 => "SRV", 6 => "SOA", 2 => "NS", 12 => "PTR", 65 => "HTTPS", _ => "" };
             p.str("dns_query", &name);
             if !qtype_str.is_empty() { p.str("dns_qtype", qtype_str); } else { p.num("dns_qtype_n", qtype); }
-            off = new_off + 4;
-            break; // first question only for kv
-        } else {
-            break;
         }
+        off = new_off + 4;
     }
+    if qcount > 16 { return; }
 
     // Parse answers
     if is_resp && acount > 0 {

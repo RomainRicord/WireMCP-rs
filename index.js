@@ -1,11 +1,11 @@
 // index.js - WireMCP Server
 const axios = require('axios');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const { promisify } = require('util');
 const which = require('which');
 const fs = require('fs').promises;
 const path = require('path');
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
@@ -28,7 +28,7 @@ async function findTshark() {
     
     for (const path of fallbacks) {
       try {
-        await execAsync(`${path} -v`);
+        await execFileAsync(path, ['-v']);
         console.error(`Found tshark at fallback: ${path}`);
         return path;
       } catch (e) {
@@ -48,9 +48,10 @@ function sanitizeIface(name) {
 }
 
 // Initialize MCP server
+const { version } = require('./package.json');
 const server = new McpServer({
   name: 'wiremcp',
-  version: '1.0.0',
+  version,
 });
 
 // Tool 1: Capture live packet data (Rust backend)
@@ -59,7 +60,7 @@ server.tool(
   'Capture live traffic and provide raw packet data as JSON for LLM analysis. Uses native Rust parsing (basic) or tshark deep dissection (full).',
   {
     interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    duration: z.number().int().min(1).max(300).optional().default(5).describe('Capture duration in seconds (1-300)'),
     mode: z.enum(['basic', 'full']).optional().default('basic').describe('basic = fast native Rust parsing (IP, TCP, UDP, DNS, TLS SNI, HTTP, ARP, ICMP, DHCP), full = tshark deep dissection (all protocols)'),
   },
   async (args) => {
@@ -76,8 +77,8 @@ server.tool(
       const mode = args.mode;
       console.error(`[capture_packets] ${mode} mode on ${iface} for ${duration}s`);
 
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode ${mode} --max-chars 720000`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', mode, '--max-chars', '720000'],
         { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 }
       );
       if (stderr) console.error(stderr);
@@ -102,7 +103,7 @@ server.tool(
   'Capture live traffic and provide protocol hierarchy statistics for LLM analysis. Uses native Rust packet parsing.',
   {
     interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    duration: z.number().int().min(1).max(300).optional().default(5).describe('Capture duration in seconds (1-300)'),
   },
   async (args) => {
     const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
@@ -113,8 +114,8 @@ server.tool(
       const iface = sanitizeIface(args.interface);
       const duration = args.duration;
       console.error(`[get_summary_stats] Rust stats on ${iface} for ${duration}s`);
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode stats`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', 'stats'],
         { timeout: (duration + 60) * 1000 }
       );
       if (stderr) console.error(stderr);
@@ -132,7 +133,7 @@ server.tool(
   'Capture live traffic and provide TCP/UDP conversation statistics for LLM analysis. Uses native Rust packet parsing.',
   {
     interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    duration: z.number().int().min(1).max(300).optional().default(5).describe('Capture duration in seconds (1-300)'),
   },
   async (args) => {
     const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
@@ -143,8 +144,8 @@ server.tool(
       const iface = sanitizeIface(args.interface);
       const duration = args.duration;
       console.error(`[get_conversations] Rust conversations on ${iface} for ${duration}s`);
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode conversations`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', 'conversations'],
         { timeout: (duration + 60) * 1000 }
       );
       if (stderr) console.error(stderr);
@@ -162,7 +163,7 @@ server.tool(
   'Capture live traffic and check IPs against URLhaus blacklist. Uses Rust for fast capture, JS for threat lookup.',
   {
     interface: z.string().optional().default('wlo1').describe('Network interface to capture from (e.g., eth0, wlo1)'),
-    duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    duration: z.number().int().min(1).max(300).optional().default(5).describe('Capture duration in seconds (1-300)'),
   },
   async (args) => {
     const captureBin = path.join(__dirname, 'capture-rs', 'target', 'release', 'capture-packets');
@@ -174,8 +175,8 @@ server.tool(
       const duration = args.duration;
       console.error(`[check_threats] Capturing on ${iface} for ${duration}s`);
 
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --interface ${iface} --duration ${duration} --mode basic --max-chars 0`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--interface', iface, '--duration', String(duration), '--mode', 'basic', '--max-chars', '0'],
         { timeout: (duration + 60) * 1000, maxBuffer: 10 * 1024 * 1024 }
       );
       if (stderr) console.error(stderr);
@@ -288,8 +289,8 @@ server.tool(
       console.error(`[analyze_pcap] ${mode} mode on ${pcapPath}`);
       await fs.access(pcapPath);
 
-      const { stdout, stderr } = await execAsync(
-        `${captureBin} --mode ${mode} --file "${pcapPath}" --max-chars 720000`,
+      const { stdout, stderr } = await execFileAsync(
+        captureBin, ['--mode', mode, '--file', pcapPath, '--max-chars', '720000'],
         { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
       );
       if (stderr) console.error(stderr);
@@ -320,15 +321,15 @@ server.tool(
         await fs.access(pcapPath);
   
         // Extract plaintext credentials
-        const { stdout: plaintextOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e http.authbasic -e ftp.request.command -e ftp.request.arg -e telnet.data -e frame.number`,
-          { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        const { stdout: plaintextOut } = await execFileAsync(
+          tsharkPath, ['-r', pcapPath, '-T', 'fields', '-e', 'http.authbasic', '-e', 'ftp.request.command', '-e', 'ftp.request.arg', '-e', 'telnet.data', '-e', 'frame.number'],
+          { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }, maxBuffer: 50 * 1024 * 1024 }
         );
 
         // Extract Kerberos credentials
-        const { stdout: kerberosOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e kerberos.CNameString -e kerberos.realm -e kerberos.cipher -e kerberos.type -e kerberos.msg_type -e frame.number`,
-          { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        const { stdout: kerberosOut } = await execFileAsync(
+          tsharkPath, ['-r', pcapPath, '-T', 'fields', '-e', 'kerberos.CNameString', '-e', 'kerberos.realm', '-e', 'kerberos.cipher', '-e', 'kerberos.type', '-e', 'kerberos.msg_type', '-e', 'frame.number'],
+          { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` }, maxBuffer: 50 * 1024 * 1024 }
         );
 
         const lines = plaintextOut.split('\n').filter(line => line.trim());
@@ -457,8 +458,8 @@ server.tool(
   'Switch to monitor mode, scan WiFi clients on a channel, generate an HTML report, then restore managed mode. Uses native Rust binary for fast 802.11 parsing.',
   {
     interface: z.string().optional().default('wlo1').describe('WiFi interface to use'),
-    channel: z.number().optional().default(0).describe('WiFi channel to monitor (0 = auto-detect best channel)'),
-    duration: z.number().optional().default(30).describe('Capture duration in seconds'),
+    channel: z.number().int().min(0).max(196).optional().default(0).describe('WiFi channel to monitor (0 = auto-detect best channel)'),
+    duration: z.number().int().min(1).max(600).optional().default(30).describe('Capture duration in seconds (1-600)'),
     outputPath: z.string().optional().default('').describe('Output HTML file path (default: ./rapport_monitor.html)'),
   },
   async (args) => {
@@ -476,8 +477,8 @@ server.tool(
 
     try {
       console.error(`[monitor_scan] Running Rust scanner: ${iface} ch${args.channel} ${duration}s`);
-      const { stdout, stderr } = await execAsync(
-        `${binPath} --interface ${iface} --channel ${args.channel} --duration ${duration} --output "${outputFile}"`,
+      const { stdout, stderr } = await execFileAsync(
+        binPath, ['--interface', iface, '--channel', String(args.channel), '--duration', String(duration), '--output', outputFile],
         { timeout: (duration + 120) * 1000 }
       );
 
@@ -507,7 +508,7 @@ server.tool(
   'Analyze traffic for DDoS attack patterns: SYN flood, UDP flood, ICMP flood, amplification (DNS/NTP/SSDP), port scanning, fragmentation attacks. Live capture or PCAP file.',
   {
     interface: z.string().optional().default('wlo1').describe('Network interface to capture from'),
-    duration: z.number().optional().default(30).describe('Capture duration in seconds (longer = better detection)'),
+    duration: z.number().int().min(1).max(600).optional().default(30).describe('Capture duration in seconds (1-600, longer = better detection)'),
     pcapPath: z.string().optional().default('').describe('Analyze a PCAP file instead of live capture'),
   },
   async (args) => {
@@ -518,16 +519,16 @@ server.tool(
     try {
       const iface = sanitizeIface(args.interface);
       const duration = args.duration;
-      let cmd;
+      let cmdArgs;
       if (args.pcapPath) {
         await fs.access(args.pcapPath);
-        cmd = `${captureBin} --mode ddos --file "${args.pcapPath}"`;
+        cmdArgs = ['--mode', 'ddos', '--file', args.pcapPath];
         console.error(`[analyze_ddos] Analyzing ${args.pcapPath}`);
       } else {
-        cmd = `${captureBin} --mode ddos --interface ${iface} --duration ${duration}`;
+        cmdArgs = ['--mode', 'ddos', '--interface', iface, '--duration', String(duration)];
         console.error(`[analyze_ddos] Live capture on ${iface} for ${duration}s`);
       }
-      const { stdout, stderr } = await execAsync(cmd, { timeout: (duration + 60) * 1000 });
+      const { stdout, stderr } = await execFileAsync(captureBin, cmdArgs, { timeout: (duration + 60) * 1000 });
       if (stderr) console.error(stderr);
       return { content: [{ type: 'text', text: stdout }] };
     } catch (error) {

@@ -3,9 +3,7 @@ node_modules/
 npm-debug.log
 yarn-debug.log
 yarn-error.log
-package-lock.json
 yarn.lock
-.pcap
 *.cap
 
 # Environment variables
@@ -56,3 +54,7 @@ coverage/
 # Temporary files
 tmp/
 temp/
+
+# Local test data and generated reports (reports contain nearby MAC addresses / SSIDs)
+packet-captures-main/
+rapport_monitor*.html
